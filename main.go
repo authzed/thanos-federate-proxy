@@ -240,8 +240,12 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 		}
 		mms, ok := mMetadata[strippedMetricName]
 		if !ok {
-			// either metadata refresh will eventually fix this or there is something else going on
-			klog.Warningf("metadata not found for metric %s, metric metadata will be stubbed out and type set to unknown", metricName)
+			// some metrics are registered with the suffixes, so we need to try the original name
+			mms, ok = mMetadata[metricName]
+			if !ok {
+				// either metadata refresh will eventually fix this or there is something else going on
+				klog.Warningf("metadata not found for metric %s, metric metadata will be stubbed out and type set to unknown", metricName)
+			}
 		}
 
 		if len(mms) > 1 {
@@ -276,7 +280,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			case v1.MetricTypeUnknown:
 				mType = io_prometheus_client.MetricType_UNTYPED
 			default:
-				klog.Warningf("unknown metric type %s for metric %s, dropping metric", mm.Type, strippedMetricName)
+				klog.Warningf("unknown metric type %s for metric %s, dropping metric", mm.Type, metricName)
 			}
 
 			mf = &io_prometheus_client.MetricFamily{
@@ -318,7 +322,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 				for _, bucket := range sample.Histogram.Buckets {
 					upperFloat, err := strconv.ParseFloat(bucket.Upper.String(), 64)
 					if err != nil {
-						klog.Warningf("error parsing bucket upper bound %s on histogram %s, dropping bucket", bucket.Upper, strippedMetricName)
+						klog.Warningf("error parsing bucket upper bound %s on histogram %s, dropping bucket", bucket.Upper, metricName)
 						continue
 					}
 					b := &io_prometheus_client.Bucket{
@@ -330,14 +334,14 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			}
 		case v1.MetricTypeSummary:
 			// FIXME how to deal with this?
-			klog.Warningf("unsupported summary type on metric %s, dropping metric", strippedMetricName)
+			klog.Warningf("unsupported summary type on metric %s, dropping metric", metricName)
 			continue
 		case v1.MetricTypeUnknown:
 			metric.Untyped = &io_prometheus_client.Untyped{
 				Value: proto.Float64(float64(sample.Value)),
 			}
 		default:
-			klog.Warningf("unknown metric type %s on %s, dropping metric", mm.Type, strippedMetricName)
+			klog.Warningf("unknown metric type %s on %s, dropping metric", mm.Type, metricName)
 			continue
 		}
 		mf.Metric = append(mf.Metric, metric)
