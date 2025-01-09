@@ -284,7 +284,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			}
 
 			mf = &io_prometheus_client.MetricFamily{
-				Name: &metricName,
+				Name: &strippedMetricName,
 				Help: &mm.Help,
 				Type: &mType,
 				Unit: &mm.Unit,
