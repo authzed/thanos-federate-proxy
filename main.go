@@ -189,6 +189,8 @@ func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiCl
 			"match_query": matchQuery,
 			"status_code": "200",
 		}).Observe(responseTime)
+
+		w.Header().Set("Content-Type", string(contentType))
 		printVector(w, contentType, val)
 	}
 }
