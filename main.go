@@ -261,7 +261,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			mm = mms[0]
 		}
 
-		mf, ok := metricFamilies[strippedMetricName]
+		mf, ok := metricFamilies[metricName]
 		if !ok {
 			var mType io_prometheus_client.MetricType
 			switch mm.Type {
@@ -287,7 +287,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			}
 
 			mf.Metric = make([]*io_prometheus_client.Metric, 0)
-			metricFamilies[strippedMetricName] = mf
+			metricFamilies[metricName] = mf
 		}
 
 		metric := &io_prometheus_client.Metric{
