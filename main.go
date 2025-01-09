@@ -352,4 +352,12 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			klog.Errorf("error encoding metric family: %s", err.Error())
 		}
 	}
+
+	// Needed so the OpenMetrics encoder adds #EOF
+	if closer, ok := encoder.(expfmt.Closer); ok {
+		if err := closer.Close(); err != nil {
+			klog.Errorf("error closing encoder: %s", err.Error())
+		}
+	}
+
 }
