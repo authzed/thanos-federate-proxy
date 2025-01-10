@@ -46,6 +46,9 @@ func parseFlag() {
 
 var metricMetadata map[string][]v1.Metadata
 var mutex = &sync.RWMutex{}
+var metadataRequestTimeout = 5 * time.Second
+var metadataPollInterval = 1 * time.Minute
+var metadataErrorRetryInterval = 1 * time.Minute
 
 func main() {
 	parseFlag()
@@ -112,23 +115,26 @@ func main() {
 
 	go func() {
 		var err error
+		tick := time.NewTicker(1 * time.Nanosecond)
+		defer tick.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-tick.C:
 			}
 
 			klog.Infof("refreshing metric metadata")
 			mutex.Lock()
-			metadataCtx, metadataCancel := context.WithTimeout(ctx, 5*time.Second)
+			metadataCtx, metadataCancel := context.WithTimeout(ctx, metadataRequestTimeout)
 			metricMetadata, err = apiMetadataClient.Metadata(metadataCtx, "", "")
 			mutex.Unlock()
 			if err != nil {
 				klog.Errorf("error refreshing metric metadata: %s", err.Error())
-				time.Sleep(250 * time.Millisecond)
+				tick.Reset(metadataErrorRetryInterval)
 			} else {
-				time.Sleep(1 * time.Minute)
+				time.Sleep(metadataPollInterval)
 			}
 			metadataCancel()
 		}
