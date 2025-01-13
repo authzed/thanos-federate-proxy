@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -221,6 +222,8 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 	mMetadata := maps.Clone(metricMetadata)
 	mutex.RUnlock()
 
+	histogramSeen := make(map[model.Fingerprint]*io_prometheus_client.Metric)
+
 	metricFamilies := make(map[string]*io_prometheus_client.MetricFamily)
 	for _, sample := range vec {
 		// value.Metric brings the metric name as a label, so we allocate one less so it does not end up as a label in the metric family
@@ -233,6 +236,10 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 				metricName = lv
 				continue
 			}
+			// will be added as a label by the encoder
+			if ln == model.BucketLabel {
+				continue
+			}
 			labelPairs = append(labelPairs, &io_prometheus_client.LabelPair{
 				Name:  &ln,
 				Value: &lv,
@@ -240,13 +247,17 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 		}
 
 		strippedMetricName := metricName
-		if strings.HasSuffix(metricName, "_bucket") || strings.HasSuffix(metricName, "_sum") ||
-			strings.HasSuffix(metricName, "_count") || strings.HasSuffix(metricName, "_total") {
+		isHistogramSum := strings.HasSuffix(metricName, "_sum")
+		isHistogramCount := strings.HasSuffix(metricName, "_count")
+		isTotal := strings.HasSuffix(metricName, "_total")
+		isHistogram := strings.HasSuffix(metricName, "_bucket") || isHistogramSum || isHistogramCount
+		if isHistogram || isTotal {
 			strippedMetricName = metricName[:strings.LastIndex(metricName, "_")]
 		}
+
 		mms, ok := mMetadata[strippedMetricName]
 		if !ok {
-			// some metrics are registered with the suffixes, so we need to try the original name
+			// some metrics are registered with the suffixes (e.g. gauges with _count), so we need to try the original name
 			mms, ok = mMetadata[metricName]
 			if !ok {
 				// either metadata refresh will eventually fix this or there is something else going on
@@ -257,6 +268,11 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 		if len(mms) > 1 {
 			// FIXME how to deal with this?
 			klog.Warningf("metric %s has multiple metadata entries, using the first one", metricName)
+		}
+
+		// counters suffix has a special treatment. We only strip the suffix to query the metadata API
+		if isTotal {
+			strippedMetricName = metricName
 		}
 
 		// recover on unknown metrics by stubbing it out and setting to unknown type
@@ -271,7 +287,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			mm = mms[0]
 		}
 
-		mf, ok := metricFamilies[metricName]
+		mf, ok := metricFamilies[strippedMetricName]
 		if !ok {
 			var mType io_prometheus_client.MetricType
 			switch mm.Type {
@@ -297,64 +313,121 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			}
 
 			mf.Metric = make([]*io_prometheus_client.Metric, 0)
-			metricFamilies[metricName] = mf
+			metricFamilies[strippedMetricName] = mf
 		}
 
-		metric := &io_prometheus_client.Metric{
-			Label:       labelPairs,
-			TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
-		}
+		// we use the fingerprints to cluster the various buckets for the same combination of labels for the same metric
+		// into the same io_prometheus_client.Metric. Then that metric will have multiple Buckets that come out
+		// of "le"
+		// get metric fingerprint, ignore "le" and "__name__" label on histograms to get a canonical fingerprint
+		clonedMetric := sample.Metric.Clone()
+		delete(clonedMetric, model.BucketLabel)
+		// we need to strip the metric name suffixes so we can cluster _bucket, _total and _sum metrics of a histogram
+		// otherwise the label fingerprint wouldn't match
+		clonedMetric[model.MetricNameLabel] = model.LabelValue(strippedMetricName)
+		fingerprint := clonedMetric.Fingerprint()
+
 		switch mm.Type {
 		case v1.MetricTypeCounter:
-			metric.Counter = &io_prometheus_client.Counter{
-				Value: proto.Float64(float64(sample.Value)),
+			metric := &io_prometheus_client.Metric{
+				Label:       labelPairs,
+				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+				Counter: &io_prometheus_client.Counter{
+					Value: proto.Float64(float64(sample.Value)),
+				},
 			}
+
+			mf.Metric = append(mf.Metric, metric)
 		case v1.MetricTypeGauge:
-			metric.Gauge = &io_prometheus_client.Gauge{
-				Value: proto.Float64(float64(sample.Value)),
+			metric := &io_prometheus_client.Metric{
+				Label:       labelPairs,
+				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+				Gauge: &io_prometheus_client.Gauge{
+					Value: proto.Float64(float64(sample.Value)),
+				},
 			}
+
+			mf.Metric = append(mf.Metric, metric)
 		case v1.MetricTypeHistogram:
-			metric.Histogram = &io_prometheus_client.Histogram{
-				SampleCount: proto.Uint64(0),
-				SampleSum:   proto.Float64(0),
+			var metric *io_prometheus_client.Metric
+			_, metricAlreadySeen := histogramSeen[fingerprint]
+			if metricAlreadySeen {
+				metric = histogramSeen[fingerprint]
+			} else {
+				metric = &io_prometheus_client.Metric{
+					Label:       labelPairs,
+					TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+				}
+				histogramSeen[fingerprint] = metric
 			}
-			hist := sample.Histogram
-			if hist != nil {
-				metric.Histogram = &io_prometheus_client.Histogram{
-					SampleCount: proto.Uint64(uint64(hist.Count)),
-					SampleSum:   proto.Float64(float64(hist.Sum)),
-					Bucket:      make([]*io_prometheus_client.Bucket, 0, len(hist.Buckets)),
+
+			if metric.Histogram == nil {
+				metric.Histogram = &io_prometheus_client.Histogram{}
+			}
+
+			if isHistogramCount {
+				metric.Histogram.SampleCount = proto.Uint64(uint64(sample.Value))
+			} else if isHistogramSum {
+				metric.Histogram.SampleSum = proto.Float64(float64(sample.Value))
+			} else {
+				lessOrEqual := sample.Metric[model.BucketLabel]
+				upperFloat, err := strconv.ParseFloat(string(lessOrEqual), 64)
+				if err != nil {
+					klog.Warningf("error parsing bucket upper bound %s on histogram %s, dropping bucket", lessOrEqual, metricName)
+					continue
 				}
-				for _, bucket := range sample.Histogram.Buckets {
-					upperFloat, err := strconv.ParseFloat(bucket.Upper.String(), 64)
-					if err != nil {
-						klog.Warningf("error parsing bucket upper bound %s on histogram %s, dropping bucket", bucket.Upper, metricName)
-						continue
-					}
-					b := &io_prometheus_client.Bucket{
-						UpperBound:      proto.Float64(upperFloat),
-						CumulativeCount: proto.Uint64(uint64(bucket.Count)),
-					}
-					metric.Histogram.Bucket = append(metric.Histogram.Bucket, b)
+
+				b := &io_prometheus_client.Bucket{
+					UpperBound:      proto.Float64(upperFloat),
+					CumulativeCount: proto.Uint64(uint64(sample.Value)),
 				}
+				metric.Histogram.Bucket = append(metric.Histogram.Bucket, b)
+			}
+
+			if !metricAlreadySeen {
+				mf.Metric = append(mf.Metric, metric)
 			}
 		case v1.MetricTypeSummary:
 			// FIXME how to deal with this?
 			klog.Warningf("unsupported summary type on metric %s, dropping metric", metricName)
 			continue
 		case v1.MetricTypeUnknown:
-			metric.Untyped = &io_prometheus_client.Untyped{
-				Value: proto.Float64(float64(sample.Value)),
+			metric := &io_prometheus_client.Metric{
+				Label:       labelPairs,
+				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+				Untyped: &io_prometheus_client.Untyped{
+					Value: proto.Float64(float64(sample.Value)),
+				},
 			}
+
+			mf.Metric = append(mf.Metric, metric)
 		default:
 			klog.Warningf("unknown metric type %s on %s, dropping metric", mm.Type, metricName)
 			continue
 		}
-		mf.Metric = append(mf.Metric, metric)
 	}
 
-	for _, fm := range metricFamilies {
-		if err := encoder.Encode(fm); err != nil {
+	// spec indicates order by metric family is optional. SpiceDB already does, and makes it easier for humans
+	orderedKeys := make([]string, 0, len(metricFamilies))
+	for k := range metricFamilies {
+		orderedKeys = append(orderedKeys, k)
+	}
+	sort.Strings(orderedKeys)
+
+	// buckets MUST be sorted by upper bound, as required by the spec
+	// See https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#histogram-1
+	for _, family := range metricFamilies {
+		if *family.Type.Enum() == io_prometheus_client.MetricType_HISTOGRAM {
+			for _, metric := range family.Metric {
+				sort.Slice(metric.Histogram.Bucket, func(i, j int) bool {
+					return *metric.Histogram.Bucket[i].UpperBound < *metric.Histogram.Bucket[j].UpperBound
+				})
+			}
+		}
+	}
+
+	for _, key := range orderedKeys {
+		if err := encoder.Encode(metricFamilies[key]); err != nil {
 			klog.Errorf("error encoding metric family: %s", err.Error())
 		}
 	}
