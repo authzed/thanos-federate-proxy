@@ -136,7 +136,7 @@ func main() {
 				klog.Errorf("error refreshing metric metadata: %s", err.Error())
 				tick.Reset(metadataErrorRetryInterval)
 			} else {
-				time.Sleep(metadataPollInterval)
+				tick.Reset(metadataPollInterval)
 			}
 			metadataCancel()
 		}
