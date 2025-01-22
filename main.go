@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"sort"
@@ -135,7 +136,7 @@ func main() {
 				klog.Errorf("error refreshing metric metadata: %s", err.Error())
 				tick.Reset(metadataErrorRetryInterval)
 			} else {
-				time.Sleep(metadataPollInterval)
+				tick.Reset(metadataPollInterval)
 			}
 			metadataCancel()
 		}
@@ -150,6 +151,12 @@ func main() {
 	mux.HandleFunc("/federate", func(w http.ResponseWriter, r *http.Request) {
 		federate(ctx, w, r, apiClient)
 	})
+
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
 	startServer(insecureListenAddress, mux, cancel)
 }
 
