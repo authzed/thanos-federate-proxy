@@ -166,6 +166,7 @@ func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiCl
 
 	// negotiate content type, this will inform the encoder how to format the output
 	contentType := expfmt.NegotiateIncludingOpenMetrics(r.Header)
+	encoder := expfmt.NewEncoder(w, contentType)
 
 	nctx, ncancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer ncancel()
@@ -205,7 +206,14 @@ func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiCl
 		}).Observe(responseTime)
 
 		w.Header().Set("Content-Type", string(contentType))
-		printVector(w, contentType, val)
+		printVector(encoder, val)
+	}
+
+	// Needed so the OpenMetrics encoder adds #EOF
+	if closer, ok := encoder.(expfmt.Closer); ok {
+		if err := closer.Close(); err != nil {
+			klog.Errorf("error closing encoder: %s", err.Error())
+		}
 	}
 }
 
@@ -220,9 +228,8 @@ func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiCl
 // this API, so the upstream needs to be the Prometheus server. That kind of compromises the whole point of this module.
 //
 // The metadata is refreshed asynchronously on a predefined interval not to put that on the critical path
-func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value) {
+func printVector(encoder expfmt.Encoder, v model.Value) {
 	vec := v.(model.Vector)
-	encoder := expfmt.NewEncoder(w, contentType)
 
 	// clone to prevent locking the metadata for the entire duration of the encoding
 	mutex.RLock()
@@ -338,7 +345,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 		case v1.MetricTypeCounter:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
 				Counter: &io_prometheus_client.Counter{
 					Value: proto.Float64(float64(sample.Value)),
 				},
@@ -348,7 +355,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 		case v1.MetricTypeGauge:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
 				Gauge: &io_prometheus_client.Gauge{
 					Value: proto.Float64(float64(sample.Value)),
 				},
@@ -363,7 +370,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			} else {
 				metric = &io_prometheus_client.Metric{
 					Label:       labelPairs,
-					TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+					TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
 				}
 				histogramSeen[fingerprint] = metric
 			}
@@ -401,7 +408,7 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 		case v1.MetricTypeUnknown:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1000),
+				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
 				Untyped: &io_prometheus_client.Untyped{
 					Value: proto.Float64(float64(sample.Value)),
 				},
@@ -438,12 +445,4 @@ func printVector(w http.ResponseWriter, contentType expfmt.Format, v model.Value
 			klog.Errorf("error encoding metric family: %s", err.Error())
 		}
 	}
-
-	// Needed so the OpenMetrics encoder adds #EOF
-	if closer, ok := encoder.(expfmt.Closer); ok {
-		if err := closer.Close(); err != nil {
-			klog.Errorf("error closing encoder: %s", err.Error())
-		}
-	}
-
 }
