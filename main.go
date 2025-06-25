@@ -34,6 +34,7 @@ var (
 	tlsSkipVerify         bool
 	bearerFile            string
 	forceGet              bool
+	help                  bool
 )
 
 func parseFlag() {
@@ -43,6 +44,8 @@ func parseFlag() {
 	flag.BoolVar(&tlsSkipVerify, "tlsSkipVerify", false, "Skip TLS Verification")
 	flag.StringVar(&bearerFile, "bearer-file", "", "File containing bearer token for API requests")
 	flag.BoolVar(&forceGet, "force-get", false, "Force api.Client to use GET by rejecting POST requests")
+	flag.BoolVar(&help, "help", false, "Show the usage instructions")
+	klog.InitFlags(nil)
 	flag.Parse()
 }
 
@@ -54,6 +57,12 @@ var metadataErrorRetryInterval = 1 * time.Minute
 
 func main() {
 	parseFlag()
+
+	if help {
+		flag.CommandLine.PrintDefaults()
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -281,7 +290,7 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 
 		if len(mms) > 1 {
 			// FIXME how to deal with this?
-			klog.Warningf("metric %s has multiple metadata entries, using the first one", metricName)
+			klog.V(1).Infof("metric %s has multiple metadata entries, using the first one", metricName)
 		}
 
 		// counters suffix has a special treatment. We only strip the suffix to query the metadata API
