@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"maps"
 	"net"
@@ -396,7 +397,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 				lessOrEqual := sample.Metric[model.BucketLabel]
 				upperFloat, err := strconv.ParseFloat(string(lessOrEqual), 64)
 				if err != nil {
-					klog.Warningf("error parsing bucket upper bound %s on histogram %s, dropping bucket", lessOrEqual, metricName)
+					// This is coming through as empty...
+					metric, _ := json.Marshal(sample.Metric)
+					klog.Warningf("error parsing bucket upper bound %s on histogram %s, dropping bucket, raw data %s", lessOrEqual, metricName, metric)
 					continue
 				}
 
