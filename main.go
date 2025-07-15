@@ -270,6 +270,14 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 			})
 		}
 
+		// Classic histograms are just regular metrics with no `Histogram` field.
+		// If a metric has a `Histogram` field, then it's a native histogram and
+		// we should skip it.
+		if sample.Histogram != nil {
+			klog.V(1).Infof("detected that metric %s is a native histogram, skipping it", metricName)
+			continue
+		}
+
 		strippedMetricName := metricName
 		isHistogramSum := strings.HasSuffix(metricName, "_sum")
 		isHistogramCount := strings.HasSuffix(metricName, "_count")
