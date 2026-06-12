@@ -175,21 +175,21 @@ func main() {
 }
 
 func mergeContext(ctx1, ctx2 context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-    ctx, cancel := context.WithTimeoutCause(ctx1, timeout, context.DeadlineExceeded)
-    
-    stop1 := context.AfterFunc(ctx1, func() {
-        cancel(context.Cause(ctx1))
-    })
-    
-    stop2 := context.AfterFunc(ctx2, func() {
-        cancel(context.Cause(ctx2))
-    })
-    
-    return ctx, func() {
-        stop1()
-        stop2()
-        cancel(context.Canceled)
-    }
+	ctx, cancel := context.WithTimeout(ctx1, timeout)
+
+	stop1 := context.AfterFunc(ctx1, func() {
+		cancel()
+	})
+
+	stop2 := context.AfterFunc(ctx2, func() {
+		cancel()
+	})
+
+	return ctx, func() {
+		stop1()
+		stop2()
+		cancel()
+	}
 }
 
 func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiClient v1.API, timeout time.Duration) {
