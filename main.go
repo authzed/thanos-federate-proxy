@@ -27,7 +27,6 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 )
 
@@ -401,9 +400,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 		case v1.MetricTypeCounter:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+				TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				Counter: &io_prometheus_client.Counter{
-					Value: proto.Float64(float64(sample.Value)),
+					Value: new(float64(sample.Value)),
 				},
 			}
 
@@ -411,9 +410,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 		case v1.MetricTypeGauge:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+				TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				Gauge: &io_prometheus_client.Gauge{
-					Value: proto.Float64(float64(sample.Value)),
+					Value: new(float64(sample.Value)),
 				},
 			}
 
@@ -426,7 +425,7 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 			} else {
 				metric = &io_prometheus_client.Metric{
 					Label:       labelPairs,
-					TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+					TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				}
 				histogramSeen[fingerprint] = metric
 			}
@@ -436,9 +435,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 			}
 
 			if isHistogramCount {
-				metric.Histogram.SampleCount = proto.Uint64(uint64(sample.Value))
+				metric.Histogram.SampleCount = new(uint64(sample.Value))
 			} else if isHistogramSum {
-				metric.Histogram.SampleSum = proto.Float64(float64(sample.Value))
+				metric.Histogram.SampleSum = new(float64(sample.Value))
 			} else {
 				lessOrEqual := sample.Metric[model.BucketLabel]
 				upperFloat, err := strconv.ParseFloat(string(lessOrEqual), 64)
@@ -450,8 +449,8 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 				}
 
 				b := &io_prometheus_client.Bucket{
-					UpperBound:      proto.Float64(upperFloat),
-					CumulativeCount: proto.Uint64(uint64(sample.Value)),
+					UpperBound:      new(upperFloat),
+					CumulativeCount: new(uint64(sample.Value)),
 				}
 				metric.Histogram.Bucket = append(metric.Histogram.Bucket, b)
 			}
@@ -466,9 +465,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 		case v1.MetricTypeUnknown:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+				TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				Untyped: &io_prometheus_client.Untyped{
-					Value: proto.Float64(float64(sample.Value)),
+					Value: new(float64(sample.Value)),
 				},
 			}
 
