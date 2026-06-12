@@ -38,6 +38,7 @@ var (
 	bearerFile            string
 	forceGet              bool
 	help                  bool
+	timeout               time.Duration
 )
 
 func parseFlag() {
@@ -48,6 +49,7 @@ func parseFlag() {
 	flag.StringVar(&bearerFile, "bearer-file", "", "File containing bearer token for API requests")
 	flag.BoolVar(&forceGet, "force-get", false, "Force api.Client to use GET by rejecting POST requests")
 	flag.BoolVar(&help, "help", false, "Show the usage instructions")
+	flag.DurationVar(&timeout, "timeout", 2*time.Minute, "How long to wait for the upstream to respond")
 	klog.InitFlags(nil)
 	flag.Parse()
 }
@@ -161,7 +163,7 @@ func main() {
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/federate", func(w http.ResponseWriter, r *http.Request) {
-		federate(ctx, w, r, apiClient)
+		federate(ctx, w, r, apiClient, timeout)
 	})
 
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -185,7 +187,7 @@ func mergeContext(ctx1, ctx2 context.Context, timeout time.Duration) (context.Co
 	return ctx, cancel
 }
 
-func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiClient v1.API) {
+func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiClient v1.API, timeout time.Duration) {
 	params := r.URL.Query()
 	matchQueries := params["match[]"]
 
@@ -199,7 +201,7 @@ func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiCl
 	var mux sync.Mutex
 	encoder := expfmt.NewEncoder(buf, contentType)
 
-	ctx, cancel := mergeContext(ctx, r.Context(), 2*time.Minute)
+	ctx, cancel := mergeContext(ctx, r.Context(), timeout)
 	defer cancel()
 
 	if params.Del("match[]"); len(params) > 0 {
