@@ -98,7 +98,7 @@ func TestBearerToken(t *testing.T) {
 			if err != nil {
 				t.Fatal("Error:", err)
 			}
-			if m.header == nil || len(m.header) <= 0 {
+			if len(m.header) <= 0 {
 				t.Fatal("Empty headers in request")
 			}
 			if authz := m.header.Get("Authorization"); authz != validBearerHeader {

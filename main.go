@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"maps"
 	"net"
 	"net/http"
@@ -24,7 +26,7 @@ import (
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
-	"google.golang.org/protobuf/proto"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 )
 
@@ -36,6 +38,7 @@ var (
 	bearerFile            string
 	forceGet              bool
 	help                  bool
+	timeout               time.Duration
 )
 
 func parseFlag() {
@@ -46,6 +49,7 @@ func parseFlag() {
 	flag.StringVar(&bearerFile, "bearer-file", "", "File containing bearer token for API requests")
 	flag.BoolVar(&forceGet, "force-get", false, "Force api.Client to use GET by rejecting POST requests")
 	flag.BoolVar(&help, "help", false, "Show the usage instructions")
+	flag.DurationVar(&timeout, "timeout", 2*time.Minute, "How long to wait for the upstream to respond")
 	klog.InitFlags(nil)
 	flag.Parse()
 }
@@ -85,7 +89,7 @@ func main() {
 		RoundTripper: roundTripper,
 	})
 	if err != nil {
-		klog.Fatalf("error creating API client:", err)
+		klog.Fatalf("error creating API client: %v", err)
 	}
 
 	// Create a new client for metadata.
@@ -94,7 +98,7 @@ func main() {
 		RoundTripper: roundTripper,
 	})
 	if err != nil {
-		klog.Fatalf("error creating API metadata client:", err)
+		klog.Fatalf("error creating API metadata client: %v", err)
 	}
 
 	// Collect client options
@@ -102,12 +106,12 @@ func main() {
 	if bearerFile != "" {
 		fullPath, err := filepath.Abs(bearerFile)
 		if err != nil {
-			klog.Fatalf("error locating bearer file:", err)
+			klog.Fatalf("error locating bearer file: %v", err)
 		}
 		dirName, fileName := filepath.Split(fullPath)
 		bearer, err := readBearerToken(os.DirFS(dirName), fileName)
 		if err != nil {
-			klog.Fatalf("error reading bearer file:", err)
+			klog.Fatalf("error reading bearer file: %v", err)
 		}
 		options = append(options, withToken(bearer))
 	}
@@ -116,12 +120,12 @@ func main() {
 		options = append(options, withGet)
 	}
 	if c, err = newClient(c, options...); err != nil {
-		klog.Fatalf("error building custom API client:", err)
+		klog.Fatalf("error building custom API client: %v", err)
 	}
 	apiClient := v1.NewAPI(c)
 
 	if metadataC, err = newClient(metadataC, options...); err != nil {
-		klog.Fatalf("error building custom metadata API client:", err)
+		klog.Fatalf("error building custom metadata API client: %v", err)
 	}
 	apiMetadataClient := v1.NewAPI(metadataC)
 
@@ -159,7 +163,7 @@ func main() {
 	})
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/federate", func(w http.ResponseWriter, r *http.Request) {
-		federate(ctx, w, r, apiClient)
+		federate(ctx, w, r, apiClient, timeout)
 	})
 
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -170,60 +174,100 @@ func main() {
 	startServer(insecureListenAddress, mux, cancel)
 }
 
-func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiClient v1.API) {
+func mergeContext(ctx1, ctx2 context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx1, timeout)
+
+	stop1 := context.AfterFunc(ctx1, func() {
+		cancel()
+	})
+
+	stop2 := context.AfterFunc(ctx2, func() {
+		cancel()
+	})
+
+	return ctx, func() {
+		stop1()
+		stop2()
+		cancel()
+	}
+}
+
+func federate(ctx context.Context, w http.ResponseWriter, r *http.Request, apiClient v1.API, timeout time.Duration) {
 	params := r.URL.Query()
 	matchQueries := params["match[]"]
 
-	// negotiate content type, this will inform the encoder how to format the output
+	// Negotiate content type, this will inform the encoder how to format the output
 	contentType := expfmt.NegotiateIncludingOpenMetrics(r.Header)
-	encoder := expfmt.NewEncoder(w, contentType)
 
-	nctx, ncancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer ncancel()
+	// We can't write directly to the response or we may hit superfluous response.WriteHeader calls
+	// in the loop. Instead, let's write to a buffer and only write to the respose
+	// if all queries succeeded.
+	buf := new(bytes.Buffer)
+	var mux sync.Mutex
+	encoder := expfmt.NewEncoder(buf, contentType)
+
+	ctx, cancel := mergeContext(ctx, r.Context(), timeout)
+	defer cancel()
+
 	if params.Del("match[]"); len(params) > 0 {
-		nctx = addValues(nctx, params)
+		ctx = addValues(ctx, params)
 	}
+
+	start := time.Now()
+	g := new(errgroup.Group)
 	for _, matchQuery := range matchQueries {
-		start := time.Now()
-		// Ignoring warnings for now.
-		val, _, err := apiClient.Query(nctx, matchQuery, start)
-		responseTime := time.Since(start).Seconds()
+		g.Go(func() error {
+			// Ignoring warnings for now.
+			val, _, err := apiClient.Query(ctx, matchQuery, start)
+			responseTime := time.Since(start).Seconds()
+			if err != nil {
+				scrapeDurations.With(prometheus.Labels{
+					"match_query": matchQuery,
+					"status_code": "500",
+				}).Observe(responseTime)
+				cancel()
+				return fmt.Errorf("query failed: %w", err)
+			}
+			if val.Type() != model.ValVector {
+				scrapeDurations.With(prometheus.Labels{
+					"match_query": matchQuery,
+					"status_code": "502",
+				}).Observe(responseTime)
+				// TODO: should we continue to the next query?
+				cancel()
+				return fmt.Errorf("query result is not a vector: %v", val.Type())
+			}
 
-		if err != nil {
-			klog.Errorf("query failed: %s", err.Error())
 			scrapeDurations.With(prometheus.Labels{
 				"match_query": matchQuery,
-				"status_code": "500",
+				"status_code": "200",
 			}).Observe(responseTime)
-			w.WriteHeader(http.StatusInternalServerError)
-			ncancel()
-			return
-		}
-		if val.Type() != model.ValVector {
-			klog.Errorf("query result is not a vector: %v", val.Type())
-			scrapeDurations.With(prometheus.Labels{
-				"match_query": matchQuery,
-				"status_code": "502",
-			}).Observe(responseTime)
-			// TODO: should we continue to the next query?
-			w.WriteHeader(http.StatusInternalServerError)
-			ncancel()
-			return
-		}
-		scrapeDurations.With(prometheus.Labels{
-			"match_query": matchQuery,
-			"status_code": "200",
-		}).Observe(responseTime)
 
-		w.Header().Set("Content-Type", string(contentType))
-		printVector(encoder, val)
+			mux.Lock()
+			defer mux.Unlock()
+			printVector(encoder, val)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		klog.Errorf("error proxying query: %v", err)
+		return
 	}
 
 	// Needed so the OpenMetrics encoder adds #EOF
 	if closer, ok := encoder.(expfmt.Closer); ok {
 		if err := closer.Close(); err != nil {
-			klog.Errorf("error closing encoder: %s", err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			klog.Errorf("error closing encoder: %v", err)
+			return
 		}
+	}
+
+	w.Header().Set("Content-Type", string(contentType))
+	if _, err := buf.WriteTo(w); err != nil {
+		klog.Errorf("error writing response: %v", err)
 	}
 }
 
@@ -363,9 +407,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 		case v1.MetricTypeCounter:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+				TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				Counter: &io_prometheus_client.Counter{
-					Value: proto.Float64(float64(sample.Value)),
+					Value: new(float64(sample.Value)),
 				},
 			}
 
@@ -373,9 +417,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 		case v1.MetricTypeGauge:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+				TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				Gauge: &io_prometheus_client.Gauge{
-					Value: proto.Float64(float64(sample.Value)),
+					Value: new(float64(sample.Value)),
 				},
 			}
 
@@ -388,7 +432,7 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 			} else {
 				metric = &io_prometheus_client.Metric{
 					Label:       labelPairs,
-					TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+					TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				}
 				histogramSeen[fingerprint] = metric
 			}
@@ -398,9 +442,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 			}
 
 			if isHistogramCount {
-				metric.Histogram.SampleCount = proto.Uint64(uint64(sample.Value))
+				metric.Histogram.SampleCount = new(uint64(sample.Value))
 			} else if isHistogramSum {
-				metric.Histogram.SampleSum = proto.Float64(float64(sample.Value))
+				metric.Histogram.SampleSum = new(float64(sample.Value))
 			} else {
 				lessOrEqual := sample.Metric[model.BucketLabel]
 				upperFloat, err := strconv.ParseFloat(string(lessOrEqual), 64)
@@ -412,8 +456,8 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 				}
 
 				b := &io_prometheus_client.Bucket{
-					UpperBound:      proto.Float64(upperFloat),
-					CumulativeCount: proto.Uint64(uint64(sample.Value)),
+					UpperBound:      new(upperFloat),
+					CumulativeCount: new(uint64(sample.Value)),
 				}
 				metric.Histogram.Bucket = append(metric.Histogram.Bucket, b)
 			}
@@ -428,9 +472,9 @@ func printVector(encoder expfmt.Encoder, v model.Value) {
 		case v1.MetricTypeUnknown:
 			metric := &io_prometheus_client.Metric{
 				Label:       labelPairs,
-				TimestampMs: proto.Int64(sample.Timestamp.UnixNano() / 1_000_000),
+				TimestampMs: new(sample.Timestamp.UnixNano() / 1_000_000),
 				Untyped: &io_prometheus_client.Untyped{
-					Value: proto.Float64(float64(sample.Value)),
+					Value: new(float64(sample.Value)),
 				},
 			}
 

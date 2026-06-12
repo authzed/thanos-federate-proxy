@@ -94,7 +94,9 @@ func readBearerToken(fsys fs.FS, fileName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer bearerFile.Close()
+	defer func() {
+		_ = bearerFile.Close()
+	}()
 	scanner := bufio.NewScanner(bearerFile)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {

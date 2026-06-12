@@ -1,4 +1,4 @@
-FROM golang:1.23.4 AS builder
+FROM golang:1.26.4 AS builder
 LABEL org.opencontainers.image.source=https://github.com/authzed/thanos-federate-proxy
 WORKDIR /go/src/thanos-federate-proxy
 
